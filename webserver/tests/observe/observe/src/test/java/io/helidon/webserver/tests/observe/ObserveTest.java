@@ -26,6 +26,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Handler;
 import java.util.logging.Level;
+import java.util.logging.LogManager;
 import java.util.logging.Logger;
 
 import io.helidon.config.Config;
@@ -138,6 +139,17 @@ class ObserveTest {
         assertThat(response.status(), is(Status.OK_200));
         String entity = response.entity();
         assertThat("Entity: " + entity, entity, containsString("\"levels\":[\"OFF\""));
+    }
+
+    @Test
+    void testUnavailableLog4jBackend(WebClient client) {
+        String name = "test.observe.missing";
+        assertThat(client.get("/observe/log/loggers").queryParam("backend", "log4j2").request(String.class).status(),
+                   is(Status.NOT_FOUND_404));
+        assertThat(client.post("/observe/log/loggers/" + name).queryParam("backend", "log4j2")
+                           .header(HeaderNames.CONTENT_TYPE, "application/json")
+                           .submit("{\"level\":\"INFO\"}", String.class).status(), is(Status.NOT_FOUND_404));
+        assertThat(LogManager.getLogManager().getLogger(name), is((Logger) null));
     }
 
     @Test

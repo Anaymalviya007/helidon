@@ -36,6 +36,8 @@ module io.helidon.webserver.observe.log {
     requires io.helidon.service.registry;
     requires io.helidon.webserver;
     requires java.logging;
+    requires static org.apache.logging.log4j;
+    requires static org.apache.logging.log4j.core;
 
     requires transitive io.helidon.config;
     requires transitive io.helidon.webserver.observe;

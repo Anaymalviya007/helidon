@@ -21,7 +21,8 @@ import java.io.OutputStreamWriter;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.Enumeration;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -32,20 +33,22 @@ import java.util.function.Consumer;
 import java.util.logging.Filter;
 import java.util.logging.Formatter;
 import java.util.logging.Level;
-import java.util.logging.LogManager;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
+import io.helidon.http.BadRequestException;
 import io.helidon.http.Header;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.HeaderValues;
 import io.helidon.http.HttpMediaType;
+import io.helidon.http.NotFoundException;
 import io.helidon.http.Status;
-import io.helidon.http.media.EntityReader;
 import io.helidon.http.media.EntityWriter;
 import io.helidon.http.media.json.JsonSupport;
 import io.helidon.json.JsonArray;
+import io.helidon.json.JsonException;
 import io.helidon.json.JsonObject;
+import io.helidon.json.JsonParser;
 import io.helidon.webserver.http.HttpRules;
 import io.helidon.webserver.http.HttpService;
 import io.helidon.webserver.http.SecureHandler;
@@ -54,11 +57,11 @@ import io.helidon.webserver.http.ServerResponse;
 
 class LogService implements HttpService {
     private static final EntityWriter<JsonObject> WRITER = JsonSupport.serverResponseWriter();
-    private static final EntityReader<JsonObject> READER = JsonSupport.serverRequestReader();
     private static final String DEFAULT_IDLE_STRING = "%\n";
     private static final ThreadLocal<Boolean> LOG_STREAM_WRITE = new ThreadLocal<>();
 
-    private final LogManager logManager;
+    private final JulBackend jul = new JulBackend();
+    private final LoggerBackend log4j;
     private final Logger root;
     private final Map<Object, Consumer<String>> listeners = new ConcurrentHashMap<>();
     private final AtomicBoolean logHandlingInitialized = new AtomicBoolean();
@@ -71,7 +74,7 @@ class LogService implements HttpService {
     private final Charset logStreamCharset;
 
     LogService(LogObserverConfig config) {
-        this.logManager = LogManager.getLogManager();
+        this.log4j = log4jBackend();
         this.root = Logger.getLogger("");
 
         this.permitAll = config.permitAll();
@@ -88,6 +91,27 @@ class LogService implements HttpService {
         this.logStreamCharset = streamType.charset()
                 .map(Charset::forName)
                 .orElse(StandardCharsets.UTF_8);
+    }
+
+    private static LoggerBackend log4jBackend() {
+        try {
+            Class.forName("org.apache.logging.log4j.core.LoggerContext", false, LogService.class.getClassLoader());
+        } catch (ClassNotFoundException _) {
+            return null;
+        }
+        return Log4jBackend.create(Thread.currentThread().getContextClassLoader());
+    }
+
+    private static JsonObject json(LoggerBackend.LoggerLevels levels) {
+        var entry = JsonObject.builder().set("level", levels.effective());
+        if (levels.configured() != null) {
+            entry.set("configuredLevel", levels.configured());
+        }
+        return entry.build();
+    }
+
+    private static String displayName(String name) {
+        return name.isEmpty() ? "ROOT" : name;
     }
 
     @Override
@@ -179,94 +203,90 @@ class LogService implements HttpService {
     }
 
     private void unsetLoggerHandler(ServerRequest req, ServerResponse res) {
-        String logger = req.path().pathParameters().first("logger").orElse("");
-        Logger.getLogger(logger).setLevel(null);
+        Target target = target(req);
+        if (target.name().isEmpty()) {
+            throw new BadRequestException("The root logger cannot inherit a level");
+        }
+        target.backend().clear(target.name());
         res.status(Status.NO_CONTENT_204).send();
     }
 
     private void setLevelHandler(ServerRequest req, ServerResponse res) {
-        String logger = req.path().pathParameters().first("logger").orElse("");
-        JsonObject requestJson = READER.read(JsonSupport.JSON_OBJECT_TYPE,
-                                             req.content().inputStream(),
-                                             req.headers());
-
-        Level desiredLevel = Level.parse(requestJson.stringValue("level").orElse(null));
-        Logger.getLogger(logger)
-                .setLevel(desiredLevel);
-
+        Target target = target(req);
+        try {
+            String content = req.content().asOptional(String.class)
+                    .orElseThrow(() -> new BadRequestException("Missing logger level request body"));
+            JsonParser parser = JsonParser.create(content.stripTrailing());
+            JsonObject body = parser.readJsonObject();
+            if (parser.hasNext()) {
+                throw new BadRequestException("Unexpected content after logger level");
+            }
+            String level = body.stringValue("level").orElseThrow(() -> new BadRequestException("Missing level"));
+            target.backend().set(target.name(), level);
+        } catch (JsonException | IllegalArgumentException e) {
+            throw new BadRequestException("Expected a JSON object with a valid string level", e);
+        }
         res.status(Status.NO_CONTENT_204).send();
     }
 
     private void loggerHandler(ServerRequest req, ServerResponse res) {
-        String logger = req.path().pathParameters().first("logger").orElse("");
-        JsonObject.Builder rootObject = JsonObject.builder();
-        logger(rootObject, logger);
-
-        write(req, res, rootObject.build());
+        Target target = target(req);
+        write(req, res, JsonObject.builder()
+                .set(displayName(target.name()), json(target.backend().logger(target.name())))
+                .build());
     }
 
     private void allLoggersHandler(ServerRequest req, ServerResponse res) {
-        JsonObject.Builder rootObject = JsonObject.builder();
-
-        levels(rootObject);
-        loggers(rootObject);
-
-        write(req, res, rootObject.build());
-    }
-
-    private void loggers(JsonObject.Builder rootObject) {
-        JsonObject.Builder loggersJson = JsonObject.builder();
-
-        Enumeration<String> loggerNames = logManager.getLoggerNames();
-        while (loggerNames.hasMoreElements()) {
-            logger(loggersJson, loggerNames.nextElement());
+        LoggerBackend selected = selectedBackend(req);
+        List<LoggerBackend> backends = selected == null && log4j != null
+                ? List.of(jul, log4j)
+                : List.of(selected == null ? jul : selected);
+        var levels = new LinkedHashSet<String>();
+        var loggers = new LinkedHashMap<String, LoggerBackend.LoggerLevels>();
+        for (LoggerBackend backend : backends) {
+            levels.addAll(backend.levels());
+            backend.forEach(loggers::putIfAbsent);
         }
-
-        rootObject.set("loggers", loggersJson.build());
+        JsonObject.Builder entries = JsonObject.builder();
+        loggers.forEach((name, info) -> entries.set(displayName(name), json(info)));
+        // ROOT in a listing always represents the actual root, even if a literal ROOT logger exists.
+        entries.set("ROOT", json(backends.getFirst().logger("")));
+        write(req, res, JsonObject.builder()
+                .set("levels", JsonArray.createStrings(List.copyOf(levels)))
+                .set("loggers", entries.build())
+                .build());
     }
 
-    private void logger(JsonObject.Builder parentJson, String loggerName) {
-        Logger logger = Logger.getLogger(loggerName);
-
-        Level configuredLevel = logger.getLevel();
-        Level effectiveLevel = effectiveLevel(logger);
-
-        JsonObject.Builder loggerJson = JsonObject.builder();
-        if (configuredLevel != null) {
-            loggerJson.set("configuredLevel", configuredLevel.getName());
+    private Target target(ServerRequest req) {
+        String name = req.path().pathParameters().first("logger").orElseThrow();
+        LoggerBackend selected = selectedBackend(req);
+        if (selected != null) {
+            return new Target(selected, "ROOT".equals(name) ? "" : name);
         }
-        loggerJson.set("level", effectiveLevel.getName());
-
-        parentJson.set("".equals(loggerName) ? "ROOT" : loggerName, loggerJson.build());
+        if (log4j != null && !"ROOT".equals(name) && !jul.owns(name) && log4j.owns(name)) {
+            return new Target(log4j, name);
+        }
+        return new Target(jul, name);
     }
 
-    private void levels(JsonObject.Builder rootObject) {
-        rootObject.set("levels",
-                       JsonArray.createStrings(List.of(Level.OFF.getName(),
-                                                       Level.SEVERE.getName(),
-                                                       Level.WARNING.getName(),
-                                                       Level.INFO.getName(),
-                                                       Level.FINE.getName(),
-                                                       Level.FINER.getName(),
-                                                       Level.FINEST.getName())));
-    }
-
-    private Level effectiveLevel(Logger logger) {
-        Level level = logger.getLevel();
-        if (level == null) {
-            if (logger == root) {
-                // we did not get a log level for parent, just assume the default
-                return Level.INFO;
+    private LoggerBackend selectedBackend(ServerRequest req) {
+        List<String> values = req.query().all("backend", List::of);
+        if (values.isEmpty()) {
+            return null;
+        }
+        if (values.size() != 1) {
+            throw new BadRequestException("Specify one backend: jul or log4j2");
+        }
+        return switch (values.getFirst()) {
+        case "jul" -> jul;
+        case "log4j2" -> {
+            if (log4j == null) {
+                throw new NotFoundException("Log4j2 Core is unavailable");
             }
-
-            Logger parent = logger.getParent();
-            if (parent == null) {
-                return effectiveLevel(root);
-            }
-
-            return effectiveLevel(parent);
+            yield log4j;
         }
-        return level;
+        default -> throw new BadRequestException("Unknown logger backend: " + values.getFirst());
+        };
     }
 
     private void write(ServerRequest req, ServerResponse res, JsonObject json) {
@@ -315,5 +335,8 @@ class LogService implements HttpService {
                 }
             });
         }
+    }
+
+    private record Target(LoggerBackend backend, String name) {
     }
 }
